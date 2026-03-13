@@ -9,19 +9,36 @@ import { z } from 'zod';
 
 const PORT = Number(process.env.PORT || 4000);
 const SERVER_NAME = process.env.SERVER_NAME || 'appointment-metadata-mcp';
-const SPEC_FILE = process.env.SPEC_FILE || './openapi/appointment-api.yaml';
 const ALLOW_RAW_SPEC =
   String(process.env.ALLOW_RAW_SPEC || process.env.ALLOW_WRITE_TOOLS || 'false').toLowerCase() === 'true';
 
-const resolvedSpecPath = path.resolve(process.cwd(), SPEC_FILE);
-if (!fs.existsSync(resolvedSpecPath)) {
-  throw new Error(`SPEC_FILE not found: ${resolvedSpecPath}`);
-}
+const SPEC_FILES = [
+  './openapi/appointment-api.yaml',
+  './openapi/multi-point-inspection-api.yaml'
+];
 
-const rawSpec = fs.readFileSync(resolvedSpecPath, 'utf8');
-const spec = yaml.load(rawSpec) as Record<string, any>;
-const paths = (spec.paths ?? {}) as Record<string, Record<string, any>>;
-const schemas = (spec.components?.schemas ?? {}) as Record<string, any>;
+const loadedApis = SPEC_FILES.map((filePath) => {
+  const resolvedPath = path.resolve(process.cwd(), filePath);
+
+  if (!fs.existsSync(resolvedPath)) {
+    throw new Error(`Spec not found: ${resolvedPath}`);
+  }
+
+  const raw = fs.readFileSync(resolvedPath, 'utf8');
+  const parsed = yaml.load(raw) as Record<string, any>;
+
+  const domain_name = filePath.includes('multi-point')
+    ? 'multi-point-inspection'
+    : 'appointment';
+
+  return {
+    domain_name,
+    raw,
+    spec: parsed,
+    paths: parsed.paths ?? {},
+    schemas: parsed.components?.schemas ?? {}
+  };
+});
 
 const HTTP_METHODS = ['get', 'post', 'put', 'patch', 'delete', 'options', 'head'];
 
@@ -42,7 +59,7 @@ function isWriteMethod(method: string): boolean {
   return ['post', 'put', 'patch', 'delete'].includes(method.toLowerCase());
 }
 
-function listOperationsInternal(): Operation[] {
+function listOperationsInternal(paths: Record<string, Record<string, any>>): Omit<Operation, 'domain_name'>[] {
   return Object.entries(paths).flatMap(([route, methods]) =>
     Object.entries(methods)
       .filter(([method]) => HTTP_METHODS.includes(method.toLowerCase()))
@@ -67,8 +84,12 @@ function listOperationsInternal(): Operation[] {
   );
 }
 
-const operations = listOperationsInternal();
-
+const operations: Operation[] = loadedApis.flatMap(api =>
+  listOperationsInternal(api.paths).map(op => ({
+    ...op,
+    domain_name: api.domain_name
+  }))
+);
 function jsonToolResult(data: unknown, label?: string) {
   return {
     structuredContent: data,
@@ -93,14 +114,18 @@ function safeErrorResult(message: string) {
   return textToolResult(message);
 }
 
-function findOperation(identifier: string): Operation | undefined {
+function findOperation(identifier: string, domain_name?: string): Operation | undefined {
   const normalized = identifier.trim();
-  return operations.find(
-    op =>
+
+  return operations.find(op => {
+    if (domain_name && op.domain_name !== domain_name) return false;
+
+    return (
       op.operationId === normalized ||
       `${op.method} ${op.path}` === normalized ||
       `${op.method.toLowerCase()} ${op.path}` === normalized.toLowerCase()
-  );
+    );
+  });
 }
 
 function summarizeForBusiness(op: Operation): string {
@@ -157,33 +182,6 @@ function schemaRefsFromNode(node: any, refs = new Set<string>()): Set<string> {
   return refs;
 }
 
-function getSchemaDependencies(schemaName: string) {
-  const seen = new Set<string>();
-  const edges: Array<{ from: string; to: string }> = [];
-
-  function walk(name: string) {
-    if (seen.has(name)) return;
-    seen.add(name);
-
-    const schema = schemas[name];
-    if (!schema) return;
-
-    const refs = Array.from(schemaRefsFromNode(schema));
-    for (const dep of refs) {
-      edges.push({ from: name, to: dep });
-      walk(dep);
-    }
-  }
-
-  walk(schemaName);
-
-  return {
-    schema_name: schemaName,
-    direct_dependencies: edges.filter(e => e.from === schemaName).map(e => e.to),
-    all_dependencies: Array.from(seen).filter(name => name !== schemaName),
-    dependency_edges: edges
-  };
-}
 
 function findOperationSchemaRefs(op: Operation): string[] {
   const refs = new Set<string>();
@@ -193,35 +191,44 @@ function findOperationSchemaRefs(op: Operation): string[] {
   return Array.from(refs);
 }
 
-function pickOperationsByGroup(group: string): Operation[] {
+function pickOperationsByGroup(group: string, domain_name?: string): Operation[] {
   const key = group.toLowerCase();
 
+  const scopedOperations = domain_name
+    ? operations.filter(op => op.domain_name === domain_name)
+    : operations;
+
   if (key === 'core' || key === 'appointment-core') {
-    return operations.filter(op => /^\/appointments(\/\{appointment_key\})?$/.test(op.path));
+    return scopedOperations.filter(op =>
+      /^\/appointments(\/\{appointment_key\})?$/.test(op.path)
+    );
   }
 
   if (key === 'workflow' || key === 'commands') {
-    return operations.filter(op => op.path.includes('/commands') || op.path.includes('/capabilities'));
+    return scopedOperations.filter(op =>
+      op.path.includes('/commands') || op.path.includes('/capabilities')
+    );
   }
 
   if (key === 'insights' || key === 'exports' || key === 'events') {
-    return operations.filter(
-      op => op.path.includes('/event-messages') || op.path.includes('/exports') || op.path.includes('/batch')
+    return scopedOperations.filter(op =>
+      op.path.includes('/event-messages') ||
+      op.path.includes('/exports') ||
+      op.path.includes('/batch')
     );
   }
 
   if (key === 'customer-facing' || key === 'consumer') {
-    return operations.filter(
-      op =>
-        /^\/appointments(\/\{appointment_key\})?$/.test(op.path) ||
-        op.path.includes('/capabilities') ||
-        op.path.includes('/commands')
+    return scopedOperations.filter(op =>
+      /^\/appointments(\/\{appointment_key\})?$/.test(op.path) ||
+      op.path.includes('/capabilities') ||
+      op.path.includes('/commands')
     );
   }
 
   return [];
 }
-
+ 
 function generateReducedSpec(name: string, selectedOperations: Operation[]) {
   const selectedPathMap: Record<string, Record<string, any>> = {};
   const schemaNames = new Set<string>();
@@ -265,24 +272,44 @@ app.use(express.json({ limit: '1mb' }));
 
 const server = new McpServer({ name: SERVER_NAME, version: '2.0.0' });
 
+
 server.tool(
   'getApiOverview',
-  'Return a high-level summary of the Appointment API and its business capabilities.',
-  {},
-  async () => {
+  'Return a high-level summary of one API domain or all loaded API domains.',
+  {
+    domain_name: z.string().optional()
+  },
+  async ({ domain_name }) => {
     try {
-      const overview = {
-        openapi: spec.openapi,
-        title: spec.info?.title,
-        version: spec.info?.version,
-        description: spec.info?.description,
-        operation_count: operations.length,
-        schema_count: Object.keys(schemas).length,
-        read_operations: operations.filter(op => !op.is_write).length,
-        write_operations: operations.filter(op => op.is_write).length,
-        domain_buckets: inferDomainBuckets()
-      };
-      return jsonToolResult(overview, 'Appointment API overview');
+      const matchingApis = domain_name
+        ? loadedApis.filter(api => api.domain_name === domain_name)
+        : loadedApis;
+
+      if (!matchingApis.length) {
+        return safeErrorResult(`Domain not found: ${domain_name}`);
+      }
+
+      const overview = matchingApis.map(api => {
+        const apiOperations = operations.filter(op => op.domain_name === api.domain_name);
+        const apiSchemas = api.schemas ?? {};
+
+        return {
+          domain_name: api.domain_name,
+          openapi: api.spec.openapi,
+          title: api.spec.info?.title,
+          version: api.spec.info?.version,
+          description: api.spec.info?.description,
+          operation_count: apiOperations.length,
+          schema_count: Object.keys(apiSchemas).length,
+          read_operations: apiOperations.filter(op => !op.is_write).length,
+          write_operations: apiOperations.filter(op => op.is_write).length
+        };
+      });
+
+      return jsonToolResult(
+        domain_name ? overview[0] : { domains: overview },
+        domain_name ? `Overview for ${domain_name}` : 'Overview for all loaded domains'
+      );
     } catch (error: any) {
       console.error('getApiOverview failed', error);
       return safeErrorResult(`getApiOverview failed: ${error?.message ?? String(error)}`);
@@ -292,20 +319,25 @@ server.tool(
 
 server.tool(
   'listOperations',
-  'List all operations, optionally filtering by text or by read vs write intent.',
+  'List all operations, optionally filtering by domain, text, or by read vs write intent.',
   {
+    domain_name: z.string().optional(),
     query: z.string().optional(),
     include_write: z.boolean().optional().default(true),
     include_read: z.boolean().optional().default(true),
     group: z.enum(['all', 'core', 'workflow', 'insights', 'customer-facing']).optional().default('all'),
     limit: z.number().int().min(1).max(200).optional().default(100)
   },
-  async ({ query, include_write = true, include_read = true, group = 'all', limit = 100 }) => {
+  async ({ domain_name, query, include_write = true, include_read = true, group = 'all', limit = 100 }) => {
     try {
       const q = query?.toLowerCase().trim();
-      const base = group === 'all' ? operations : pickOperationsByGroup(group);
+
+      const base = group === 'all'
+        ? operations
+        : pickOperationsByGroup(group, domain_name);
 
       const filtered = base.filter(op => {
+        if (domain_name && op.domain_name !== domain_name) return false;
         if (op.is_write && !include_write) return false;
         if (!op.is_write && !include_read) return false;
         if (!q) return true;
@@ -314,8 +346,10 @@ server.tool(
       });
 
       const limited = filtered.slice(0, limit);
+
       return jsonToolResult(
         {
+          domain_name: domain_name ?? 'all',
           count: filtered.length,
           returned: limited.length,
           limit,
@@ -357,20 +391,44 @@ server.tool(
 );
 
 server.tool(
+  'listDomains',
+  'List available API domains loaded in this MCP server.',
+  {},
+  async () => ({
+    content: [
+      {
+        type: 'json',
+        json: {
+          domains: loadedApis.map(api => api.domain_name)
+        }
+      }
+    ]
+  })
+);
+
+server.tool(
   'getOperationDetails',
-  'Get details for one operation by operationId or exact "METHOD /path".',
-  { identifier: z.string() },
-  async ({ identifier }) => {
+  'Get details for one operation by operationId or exact "METHOD /path", optionally scoped to a domain.',
+  {
+    domain_name: z.string().optional(),
+    identifier: z.string()
+  },
+  async ({ domain_name, identifier }) => {
     try {
-      const op = findOperation(identifier);
+      const op = findOperation(identifier, domain_name);
       if (!op) {
-        return safeErrorResult(`Operation not found: ${identifier}`);
+        return safeErrorResult(
+          domain_name
+            ? `Operation not found in domain '${domain_name}': ${identifier}`
+            : `Operation not found: ${identifier}`
+        );
       }
 
       return jsonToolResult(
         {
           ...op,
-          schema_refs: findOperationSchemaRefs(op)
+          schema_refs: findOperationSchemaRefs(op),
+          domain_name: op.domain_name
         },
         `Operation details for ${identifier}`
       );
@@ -401,31 +459,47 @@ server.tool(
 
 server.tool(
   'listSchemas',
-  'List schema names, optionally filtered by a text query.',
+  'List schema names, optionally filtered by domain and text query.',
   {
+    domain_name: z.string().optional(),
     query: z.string().optional(),
     limit: z.number().int().min(1).max(200).optional().default(100)
   },
-  async ({ query, limit = 100 }) => {
+  async ({ domain_name, query, limit = 100 }) => {
     try {
       const q = query?.toLowerCase().trim();
 
-      const result = Object.entries(schemas)
-        .filter(
-          ([name, schema]: [string, any]) =>
-            !q || name.toLowerCase().includes(q) || JSON.stringify(schema).toLowerCase().includes(q)
-        )
-        .map(([name, schema]: [string, any]) => ({
-          name,
-          type: schema.type ?? null,
-          description: schema.description ?? '',
-          required_count: Array.isArray(schema.required) ? schema.required.length : 0,
-          property_count: schema.properties ? Object.keys(schema.properties).length : 0
-        }));
+      const matchingApis = domain_name
+        ? loadedApis.filter(api => api.domain_name === domain_name)
+        : loadedApis;
+
+      if (!matchingApis.length) {
+        return safeErrorResult(`Domain not found: ${domain_name}`);
+      }
+
+      const result = matchingApis.flatMap(api =>
+        Object.entries(api.schemas ?? {})
+          .filter(
+            ([name, schema]: [string, any]) =>
+              !q ||
+              name.toLowerCase().includes(q) ||
+              JSON.stringify(schema).toLowerCase().includes(q)
+          )
+          .map(([name, schema]: [string, any]) => ({
+            domain_name: api.domain_name,
+            name,
+            type: schema.type ?? null,
+            description: schema.description ?? '',
+            required_count: Array.isArray(schema.required) ? schema.required.length : 0,
+            property_count: schema.properties ? Object.keys(schema.properties).length : 0
+          }))
+      );
 
       const limited = result.slice(0, limit);
+
       return jsonToolResult(
         {
+          domain_name: domain_name ?? 'all',
           count: result.length,
           returned: limited.length,
           limit,
@@ -442,20 +516,56 @@ server.tool(
 
 server.tool(
   'getSchema',
-  'Return a schema definition by exact schema name from components.schemas.',
-  { schema_name: z.string() },
-  async ({ schema_name }) => {
+  'Return a schema definition by exact schema name from a specific domain or from all loaded domains.',
+  {
+    domain_name: z.string().optional(),
+    schema_name: z.string()
+  },
+  async ({ domain_name, schema_name }) => {
     try {
-      const schema = schemas[schema_name];
-      if (!schema) {
-        return safeErrorResult(`Schema not found: ${schema_name}`);
+      const matchingApis = domain_name
+        ? loadedApis.filter(api => api.domain_name === domain_name)
+        : loadedApis;
+
+      if (!matchingApis.length) {
+        return safeErrorResult(`Domain not found: ${domain_name}`);
       }
+
+      const matches = matchingApis
+        .filter(api => api.schemas && api.schemas[schema_name])
+        .map(api => ({
+          domain_name: api.domain_name,
+          schema: api.schemas[schema_name]
+        }));
+
+      if (!matches.length) {
+        return safeErrorResult(
+          domain_name
+            ? `Schema not found in domain '${domain_name}': ${schema_name}`
+            : `Schema not found: ${schema_name}`
+        );
+      }
+
+      if (!domain_name && matches.length > 1) {
+        return jsonToolResult(
+          {
+            schema_name,
+            message: 'Schema exists in multiple domains. Please provide domain_name.',
+            matches: matches.map(m => ({ domain_name: m.domain_name }))
+          },
+          `Schema '${schema_name}' found in multiple domains`
+        );
+      }
+
+      const selected = matches[0];
+      const selectedApi = matchingApis.find(api => api.domain_name === selected.domain_name)!;
 
       return jsonToolResult(
         {
+          domain_name: selected.domain_name,
           schema_name,
-          schema,
-          dependencies: getSchemaDependencies(schema_name)
+          schema: selected.schema,
+          dependencies: getSchemaDependencies(selectedApi.schemas, schema_name)
         },
         `Schema details for ${schema_name}`
       );
@@ -466,22 +576,33 @@ server.tool(
   }
 );
 
-server.tool(
-  'getSchemaDependencies',
-  'Show direct and transitive schema dependencies for one schema.',
-  { schema_name: z.string() },
-  async ({ schema_name }) => {
-    try {
-      if (!schemas[schema_name]) {
-        return safeErrorResult(`Schema not found: ${schema_name}`);
-      }
-      return jsonToolResult(getSchemaDependencies(schema_name), `Dependencies for ${schema_name}`);
-    } catch (error: any) {
-      console.error('getSchemaDependencies failed', error);
-      return safeErrorResult(`getSchemaDependencies failed: ${error?.message ?? String(error)}`);
+function getSchemaDependencies(domainSchemas: Record<string, any>, schemaName: string) {
+  const seen = new Set<string>();
+  const edges: Array<{ from: string; to: string }> = [];
+
+  function walk(name: string) {
+    if (seen.has(name)) return;
+    seen.add(name);
+
+    const schema = domainSchemas[name];
+    if (!schema) return;
+
+    const refs = Array.from(schemaRefsFromNode(schema));
+    for (const dep of refs) {
+      edges.push({ from: name, to: dep });
+      walk(dep);
     }
   }
-);
+
+  walk(schemaName);
+
+  return {
+    schema_name: schemaName,
+    direct_dependencies: edges.filter(e => e.from === schemaName).map(e => e.to),
+    all_dependencies: Array.from(seen).filter(name => name !== schemaName),
+    dependency_edges: edges
+  };
+}
 
 server.tool(
   'suggestSubApis',
@@ -581,7 +702,9 @@ app.get('/', (_req, res) => {
     status: 'ok',
     health: '/health',
     mcp: '/mcp',
+    domains: loadedApis.map(api => api.domain_name),
     tools: [
+      'listDomains',
       'getApiOverview',
       'listOperations',
       'listWriteOperations',
@@ -589,11 +712,22 @@ app.get('/', (_req, res) => {
       'explainOperationForBusiness',
       'listSchemas',
       'getSchema',
-      'getSchemaDependencies',
       'suggestSubApis',
       'generateSubApiSpec',
       'generateConsumerSummary'
     ]
+  });
+});
+
+app.get('/health', (_req, res) => {
+  res.json({
+    status: 'ok',
+    service: SERVER_NAME,
+    domains: loadedApis.map(api => api.domain_name),
+    api_count: loadedApis.length,
+    operations: operations.length,
+    schemas: loadedApis.reduce((total, api) => total + Object.keys(api.schemas ?? {}).length, 0),
+    version: '2.0.0'
   });
 });
 
@@ -607,7 +741,6 @@ app.get('/health', (_req, res) => {
     version: '2.0.0'
   });
 });
-
 app.post('/mcp', async (req: Request, res: Response) => {
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   res.on('close', () => transport.close());
