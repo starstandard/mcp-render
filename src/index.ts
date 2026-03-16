@@ -830,7 +830,7 @@ app.get('/mcp', (_req: Request, res: Response) => {
 });
 
 // OpenAI-facing endpoint
-app.post('/openai-mcp', async (req: Request, res: Response) => {
+app.all('/openai-mcp', async (req: Request, res: Response) => {
   await handleMcpRequest(req, res);
 });
 
