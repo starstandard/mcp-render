@@ -17,7 +17,15 @@ const SPEC_FILES = [
   './openapi/multi-point-inspection-api.yaml'
 ];
 
-const loadedApis = SPEC_FILES.map((filePath) => {
+type LoadedApi = {
+  domain_name: string;
+  raw: string;
+  spec: Record<string, any>;
+  paths: Record<string, Record<string, any>>;
+  schemas: Record<string, any>;
+};
+
+const loadedApis: LoadedApi[] = SPEC_FILES.map((filePath) => {
   const resolvedPath = path.resolve(process.cwd(), filePath);
 
   if (!fs.existsSync(resolvedPath)) {
@@ -35,14 +43,15 @@ const loadedApis = SPEC_FILES.map((filePath) => {
     domain_name,
     raw,
     spec: parsed,
-    paths: parsed.paths ?? {},
-    schemas: parsed.components?.schemas ?? {}
+    paths: (parsed.paths ?? {}) as Record<string, Record<string, any>>,
+    schemas: (parsed.components?.schemas ?? {}) as Record<string, any>
   };
 });
 
 const HTTP_METHODS = ['get', 'post', 'put', 'patch', 'delete', 'options', 'head'];
 
 type Operation = {
+  domain_name: string;
   path: string;
   method: string;
   operationId: string | null;
@@ -59,37 +68,43 @@ function isWriteMethod(method: string): boolean {
   return ['post', 'put', 'patch', 'delete'].includes(method.toLowerCase());
 }
 
-function listOperationsInternal(paths: Record<string, Record<string, any>>): Omit<Operation, 'domain_name'>[] {
-  return Object.entries(paths).flatMap(([route, methods]) =>
+function listOperationsInternal(
+  apiPaths: Record<string, Record<string, any>>
+): Omit<Operation, 'domain_name'>[] {
+  return Object.entries(apiPaths).flatMap(([route, methods]) =>
     Object.entries(methods)
       .filter(([method]) => HTTP_METHODS.includes(method.toLowerCase()))
-      .map(([method, op]) => ({
-        path: route,
-        method: method.toUpperCase(),
-        operationId: op.operationId ?? null,
-        summary: op.summary ?? '',
-        description: op.description ?? '',
-        tags: op.tags ?? [],
-        is_write: isWriteMethod(method),
-        parameters: (op.parameters ?? []).map((p: any) => ({
-          name: p.name,
-          in: p.in,
-          required: !!p.required,
-          schema: p.schema ?? null,
-          description: p.description ?? ''
-        })),
-        requestBody: op.requestBody ?? null,
-        responses: op.responses ?? {}
-      }))
+      .map(([method, op]) => {
+        const operation = op as Record<string, any>;
+        return {
+          path: route,
+          method: method.toUpperCase(),
+          operationId: (operation.operationId as string | undefined) ?? null,
+          summary: (operation.summary as string | undefined) ?? '',
+          description: (operation.description as string | undefined) ?? '',
+          tags: (operation.tags as string[] | undefined) ?? [],
+          is_write: isWriteMethod(method),
+          parameters: ((operation.parameters as any[]) ?? []).map((p: any) => ({
+            name: p.name,
+            in: p.in,
+            required: !!p.required,
+            schema: p.schema ?? null,
+            description: p.description ?? ''
+          })),
+          requestBody: operation.requestBody ?? null,
+          responses: (operation.responses as Record<string, unknown>) ?? {}
+        };
+      })
   );
 }
 
-const operations: Operation[] = loadedApis.flatMap(api =>
-  listOperationsInternal(api.paths).map(op => ({
+const operations: Operation[] = loadedApis.flatMap((api) =>
+  listOperationsInternal(api.paths).map((op) => ({
     ...op,
     domain_name: api.domain_name
   }))
 );
+
 function jsonToolResult(data: unknown, label?: string) {
   return {
     structuredContent: data,
@@ -117,7 +132,7 @@ function safeErrorResult(message: string) {
 function findOperation(identifier: string, domain_name?: string): Operation | undefined {
   const normalized = identifier.trim();
 
-  return operations.find(op => {
+  return operations.find((op) => {
     if (domain_name && op.domain_name !== domain_name) return false;
 
     return (
@@ -134,7 +149,10 @@ function summarizeForBusiness(op: Operation): string {
     .map((p: any) => `${p.name}${p.required ? ' (required)' : ''}`)
     .join(', ');
   const hasBody = !!op.requestBody;
-  const writes = op.is_write ? 'This changes data or triggers a workflow.' : 'This reads data only.';
+  const writes = op.is_write
+    ? 'This changes data or triggers a workflow.'
+    : 'This reads data only.';
+
   return `${action}. Route: ${op.method} ${op.path}. ${writes} ${
     params ? `Main inputs: ${params}.` : ''
   } ${hasBody ? 'It also accepts a JSON request body.' : ''}`.trim();
@@ -142,31 +160,49 @@ function summarizeForBusiness(op: Operation): string {
 
 function inferDomainBuckets() {
   const buckets = [
-    { name: 'Core Appointment CRUD', match: (op: Operation) => /^\/appointments(\/\{appointment_key\})?$/.test(op.path) },
-    { name: 'Capabilities & metadata', match: (op: Operation) => op.path.includes('/capabilities') },
-    { name: 'Bulk and exports', match: (op: Operation) => op.path.includes('/batch') || op.path.includes('/exports') },
-    { name: 'Commands / workflows', match: (op: Operation) => op.path.includes('/commands') },
-    { name: 'Event messages / audit trail', match: (op: Operation) => op.path.includes('/event-messages') }
+    {
+      name: 'Core Appointment CRUD',
+      match: (op: Operation) => /^\/appointments(\/\{appointment_key\})?$/.test(op.path)
+    },
+    {
+      name: 'Capabilities & metadata',
+      match: (op: Operation) => op.path.includes('/capabilities')
+    },
+    {
+      name: 'Bulk and exports',
+      match: (op: Operation) => op.path.includes('/batch') || op.path.includes('/exports')
+    },
+    {
+      name: 'Commands / workflows',
+      match: (op: Operation) => op.path.includes('/commands')
+    },
+    {
+      name: 'Event messages / audit trail',
+      match: (op: Operation) => op.path.includes('/event-messages')
+    }
   ];
 
   return buckets
-    .map(bucket => ({
+    .map((bucket) => ({
       name: bucket.name,
-      operations: operations.filter(bucket.match).map(op => ({
+      operations: operations.filter(bucket.match).map((op) => ({
+        domain_name: op.domain_name,
         method: op.method,
         path: op.path,
         operationId: op.operationId,
         summary: op.summary
       }))
     }))
-    .filter(b => b.operations.length > 0);
+    .filter((b) => b.operations.length > 0);
 }
 
 function schemaRefsFromNode(node: any, refs = new Set<string>()): Set<string> {
   if (!node || typeof node !== 'object') return refs;
 
   if (Array.isArray(node)) {
-    for (const item of node) schemaRefsFromNode(item, refs);
+    for (const item of node) {
+      schemaRefsFromNode(item, refs);
+    }
     return refs;
   }
 
@@ -182,7 +218,6 @@ function schemaRefsFromNode(node: any, refs = new Set<string>()): Set<string> {
   return refs;
 }
 
-
 function findOperationSchemaRefs(op: Operation): string[] {
   const refs = new Set<string>();
   schemaRefsFromNode(op.parameters, refs);
@@ -191,56 +226,91 @@ function findOperationSchemaRefs(op: Operation): string[] {
   return Array.from(refs);
 }
 
+function getSchemaDependencies(domainSchemas: Record<string, any>, schemaName: string) {
+  const seen = new Set<string>();
+  const edges: Array<{ from: string; to: string }> = [];
+
+  function walk(name: string) {
+    if (seen.has(name)) return;
+    seen.add(name);
+
+    const schema = domainSchemas[name];
+    if (!schema) return;
+
+    const refs = Array.from(schemaRefsFromNode(schema));
+    for (const dep of refs) {
+      edges.push({ from: name, to: dep });
+      walk(dep);
+    }
+  }
+
+  walk(schemaName);
+
+  return {
+    schema_name: schemaName,
+    direct_dependencies: edges.filter((e) => e.from === schemaName).map((e) => e.to),
+    all_dependencies: Array.from(seen).filter((name) => name !== schemaName),
+    dependency_edges: edges
+  };
+}
+
 function pickOperationsByGroup(group: string, domain_name?: string): Operation[] {
   const key = group.toLowerCase();
 
   const scopedOperations = domain_name
-    ? operations.filter(op => op.domain_name === domain_name)
+    ? operations.filter((op) => op.domain_name === domain_name)
     : operations;
 
   if (key === 'core' || key === 'appointment-core') {
-    return scopedOperations.filter(op =>
+    return scopedOperations.filter((op) =>
       /^\/appointments(\/\{appointment_key\})?$/.test(op.path)
     );
   }
 
   if (key === 'workflow' || key === 'commands') {
-    return scopedOperations.filter(op =>
-      op.path.includes('/commands') || op.path.includes('/capabilities')
+    return scopedOperations.filter(
+      (op) => op.path.includes('/commands') || op.path.includes('/capabilities')
     );
   }
 
   if (key === 'insights' || key === 'exports' || key === 'events') {
-    return scopedOperations.filter(op =>
-      op.path.includes('/event-messages') ||
-      op.path.includes('/exports') ||
-      op.path.includes('/batch')
+    return scopedOperations.filter(
+      (op) =>
+        op.path.includes('/event-messages') ||
+        op.path.includes('/exports') ||
+        op.path.includes('/batch')
     );
   }
 
   if (key === 'customer-facing' || key === 'consumer') {
-    return scopedOperations.filter(op =>
-      /^\/appointments(\/\{appointment_key\})?$/.test(op.path) ||
-      op.path.includes('/capabilities') ||
-      op.path.includes('/commands')
+    return scopedOperations.filter(
+      (op) =>
+        /^\/appointments(\/\{appointment_key\})?$/.test(op.path) ||
+        op.path.includes('/capabilities') ||
+        op.path.includes('/commands')
     );
   }
 
   return [];
 }
- 
+
 function generateReducedSpec(name: string, selectedOperations: Operation[]) {
+  const appointmentApi = loadedApis.find((api) => api.domain_name === 'appointment');
+  if (!appointmentApi) {
+    throw new Error('Appointment API not loaded');
+  }
+
   const selectedPathMap: Record<string, Record<string, any>> = {};
   const schemaNames = new Set<string>();
 
   for (const op of selectedOperations) {
-    const pathEntry = paths[op.path] ?? {};
+    const pathEntry = appointmentApi.paths[op.path] ?? {};
     selectedPathMap[op.path] = selectedPathMap[op.path] ?? {};
     selectedPathMap[op.path][op.method.toLowerCase()] = pathEntry[op.method.toLowerCase()];
 
     for (const ref of findOperationSchemaRefs(op)) {
       schemaNames.add(ref);
-      for (const nested of getSchemaDependencies(ref).all_dependencies) {
+      for (const nested of getSchemaDependencies(appointmentApi.schemas, ref).all_dependencies) {
         schemaNames.add(nested);
       }
     }
@@ -248,15 +318,17 @@ function generateReducedSpec(name: string, selectedOperations: Operation[]) {
 
   const reducedSchemas: Record<string, any> = {};
   for (const schemaName of Array.from(schemaNames)) {
-    if (schemas[schemaName]) reducedSchemas[schemaName] = schemas[schemaName];
+    if (appointmentApi.schemas[schemaName]) {
+      reducedSchemas[schemaName] = appointmentApi.schemas[schemaName];
+    }
   }
 
   const reduced = {
-    openapi: spec.openapi,
+    openapi: appointmentApi.spec.openapi,
     info: {
-      title: `${spec.info?.title ?? 'API'} - ${name}`,
-      version: spec.info?.version,
-      description: `Reduced sub-API generated from ${spec.info?.title ?? 'the source API'} for ${name}.`
+      title: `${appointmentApi.spec.info?.title ?? 'API'} - ${name}`,
+      version: appointmentApi.spec.info?.version,
+      description: `Reduced sub-API generated from ${appointmentApi.spec.info?.title ?? 'the source API'} for ${name}.`
     },
     paths: selectedPathMap,
     components: {
@@ -272,7 +344,6 @@ app.use(express.json({ limit: '1mb' }));
 
 const server = new McpServer({ name: SERVER_NAME, version: '2.0.0' });
 
-
 server.tool(
   'getApiOverview',
   'Return a high-level summary of one API domain or all loaded API domains.',
@@ -282,15 +353,15 @@ server.tool(
   async ({ domain_name }) => {
     try {
       const matchingApis = domain_name
-        ? loadedApis.filter(api => api.domain_name === domain_name)
+        ? loadedApis.filter((api) => api.domain_name === domain_name)
         : loadedApis;
 
       if (!matchingApis.length) {
         return safeErrorResult(`Domain not found: ${domain_name}`);
       }
 
-      const overview = matchingApis.map(api => {
-        const apiOperations = operations.filter(op => op.domain_name === api.domain_name);
+      const overview = matchingApis.map((api) => {
+        const apiOperations = operations.filter((op) => op.domain_name === api.domain_name);
         const apiSchemas = api.schemas ?? {};
 
         return {
@@ -301,8 +372,9 @@ server.tool(
           description: api.spec.info?.description,
           operation_count: apiOperations.length,
           schema_count: Object.keys(apiSchemas).length,
-          read_operations: apiOperations.filter(op => !op.is_write).length,
-          write_operations: apiOperations.filter(op => op.is_write).length
+          read_operations: apiOperations.filter((op) => !op.is_write).length,
+          write_operations: apiOperations.filter((op) => op.is_write).length,
+          domain_buckets: api.domain_name === 'appointment' ? inferDomainBuckets() : []
         };
       });
 
@@ -332,11 +404,9 @@ server.tool(
     try {
       const q = query?.toLowerCase().trim();
 
-      const base = group === 'all'
-        ? operations
-        : pickOperationsByGroup(group, domain_name);
+      const base = group === 'all' ? operations : pickOperationsByGroup(group, domain_name);
 
-      const filtered = base.filter(op => {
+      const filtered = base.filter((op) => {
         if (domain_name && op.domain_name !== domain_name) return false;
         if (op.is_write && !include_write) return false;
         if (!op.is_write && !include_read) return false;
@@ -372,8 +442,9 @@ server.tool(
   },
   async ({ limit = 100 }) => {
     try {
-      const result = operations.filter(op => op.is_write);
+      const result = operations.filter((op) => op.is_write);
       const limited = result.slice(0, limit);
+
       return jsonToolResult(
         {
           count: result.length,
@@ -399,7 +470,7 @@ server.tool(
       {
         type: 'json',
         json: {
-          domains: loadedApis.map(api => api.domain_name)
+          domains: loadedApis.map((api) => api.domain_name)
         }
       }
     ]
@@ -442,7 +513,9 @@ server.tool(
 server.tool(
   'explainOperationForBusiness',
   'Explain an operation in plain language for non-technical stakeholders.',
-  { identifier: z.string() },
+  {
+    identifier: z.string()
+  },
   async ({ identifier }) => {
     try {
       const op = findOperation(identifier);
@@ -470,14 +543,14 @@ server.tool(
       const q = query?.toLowerCase().trim();
 
       const matchingApis = domain_name
-        ? loadedApis.filter(api => api.domain_name === domain_name)
+        ? loadedApis.filter((api) => api.domain_name === domain_name)
         : loadedApis;
 
       if (!matchingApis.length) {
         return safeErrorResult(`Domain not found: ${domain_name}`);
       }
 
-      const result = matchingApis.flatMap(api =>
+      const result = matchingApis.flatMap((api) =>
         Object.entries(api.schemas ?? {})
           .filter(
             ([name, schema]: [string, any]) =>
@@ -524,7 +597,7 @@ server.tool(
   async ({ domain_name, schema_name }) => {
     try {
       const matchingApis = domain_name
-        ? loadedApis.filter(api => api.domain_name === domain_name)
+        ? loadedApis.filter((api) => api.domain_name === domain_name)
         : loadedApis;
 
       if (!matchingApis.length) {
@@ -532,8 +605,8 @@ server.tool(
       }
 
       const matches = matchingApis
-        .filter(api => api.schemas && api.schemas[schema_name])
-        .map(api => ({
+        .filter((api) => api.schemas && api.schemas[schema_name])
+        .map((api) => ({
           domain_name: api.domain_name,
           schema: api.schemas[schema_name]
         }));
@@ -551,14 +624,14 @@ server.tool(
           {
             schema_name,
             message: 'Schema exists in multiple domains. Please provide domain_name.',
-            matches: matches.map(m => ({ domain_name: m.domain_name }))
+            matches: matches.map((m) => ({ domain_name: m.domain_name }))
           },
           `Schema '${schema_name}' found in multiple domains`
         );
       }
 
       const selected = matches[0];
-      const selectedApi = matchingApis.find(api => api.domain_name === selected.domain_name)!;
+      const selectedApi = matchingApis.find((api) => api.domain_name === selected.domain_name)!;
 
       return jsonToolResult(
         {
@@ -576,38 +649,12 @@ server.tool(
   }
 );
 
-function getSchemaDependencies(domainSchemas: Record<string, any>, schemaName: string) {
-  const seen = new Set<string>();
-  const edges: Array<{ from: string; to: string }> = [];
-
-  function walk(name: string) {
-    if (seen.has(name)) return;
-    seen.add(name);
-
-    const schema = domainSchemas[name];
-    if (!schema) return;
-
-    const refs = Array.from(schemaRefsFromNode(schema));
-    for (const dep of refs) {
-      edges.push({ from: name, to: dep });
-      walk(dep);
-    }
-  }
-
-  walk(schemaName);
-
-  return {
-    schema_name: schemaName,
-    direct_dependencies: edges.filter(e => e.from === schemaName).map(e => e.to),
-    all_dependencies: Array.from(seen).filter(name => name !== schemaName),
-    dependency_edges: edges
-  };
-}
-
 server.tool(
   'suggestSubApis',
   'Suggest smaller sub-APIs based on the Appointment spec structure.',
-  { audience: z.enum(['business', 'technical']).optional().default('technical') },
+  {
+    audience: z.enum(['business', 'technical']).optional().default('technical')
+  },
   async ({ audience = 'technical' }) => {
     try {
       const suggestions = [
@@ -618,7 +665,7 @@ server.tool(
             audience === 'business'
               ? 'Use this when the goal is booking, viewing, updating, or canceling appointments.'
               : 'Best for consumer or channel applications that need CRUD-style appointment operations.',
-          include: pickOperationsByGroup('core').map(op => `${op.method} ${op.path}`)
+          include: pickOperationsByGroup('core', 'appointment').map((op) => `${op.method} ${op.path}`)
         },
         {
           name: 'Appointment Workflow API',
@@ -627,7 +674,7 @@ server.tool(
             audience === 'business'
               ? 'Use this for appointment lifecycle actions such as confirm, cancel, or reschedule.'
               : 'Best for orchestration and state transitions such as commands and capabilities.',
-          include: pickOperationsByGroup('workflow').map(op => `${op.method} ${op.path}`)
+          include: pickOperationsByGroup('workflow', 'appointment').map((op) => `${op.method} ${op.path}`)
         },
         {
           name: 'Appointment Insights API',
@@ -636,7 +683,7 @@ server.tool(
             audience === 'business'
               ? 'Use this for audit history, export jobs, and operational reporting.'
               : 'Best for reporting, event history, external exports, and bulk-oriented flows.',
-          include: pickOperationsByGroup('insights').map(op => `${op.method} ${op.path}`)
+          include: pickOperationsByGroup('insights', 'appointment').map((op) => `${op.method} ${op.path}`)
         }
       ];
 
@@ -651,13 +698,16 @@ server.tool(
 server.tool(
   'generateSubApiSpec',
   'Generate a reduced OpenAPI YAML for a named sub-API cut.',
-  { sub_api: z.enum(['core', 'workflow', 'insights', 'customer-facing']) },
+  {
+    sub_api: z.enum(['core', 'workflow', 'insights', 'customer-facing'])
+  },
   async ({ sub_api }) => {
     try {
-      const selected = pickOperationsByGroup(sub_api);
+      const selected = pickOperationsByGroup(sub_api, 'appointment');
       if (!selected.length) {
         return safeErrorResult(`No operations matched sub_api=${sub_api}`);
       }
+
       const yamlText = generateReducedSpec(sub_api, selected);
       return textToolResult(yamlText);
     } catch (error: any) {
@@ -679,6 +729,7 @@ server.tool(
         audience === 'business'
           ? `The Appointment API manages service-scheduling appointments. It supports browsing appointments, creating and updating bookings, checking capabilities, running lifecycle commands such as cancel or reschedule, tracking export jobs, and viewing appointment event history.`
           : `The API is an OpenAPI 3.0.3 Appointment domain service with CRUD endpoints on /appointments, workflow endpoints on /appointments/{appointment_key}/commands, metadata on /appointments/capabilities, asynchronous export endpoints, and event-message retrieval. Primary request schemas include AppointmentCreate and AppointmentUpdate; primary response wrappers include AppointmentResponse and AppointmentListResponse.`;
+
       return textToolResult(text);
     } catch (error: any) {
       console.error('generateConsumerSummary failed', error);
@@ -690,9 +741,17 @@ server.tool(
 if (ALLOW_RAW_SPEC) {
   server.tool(
     'getRawSpec',
-    'Return the full raw OpenAPI document text.',
-    {},
-    async () => textToolResult(rawSpec)
+    'Return the full raw OpenAPI document text for a domain.',
+    {
+      domain_name: z.string().optional().default('appointment')
+    },
+    async ({ domain_name = 'appointment' }) => {
+      const api = loadedApis.find((a) => a.domain_name === domain_name);
+      if (!api) {
+        return safeErrorResult(`Domain not found: ${domain_name}`);
+      }
+      return textToolResult(api.raw);
+    }
   );
 }
 
@@ -702,7 +761,8 @@ app.get('/', (_req, res) => {
     status: 'ok',
     health: '/health',
     mcp: '/mcp',
-    domains: loadedApis.map(api => api.domain_name),
+    openai_mcp: '/openai-mcp',
+    domains: loadedApis.map((api) => api.domain_name),
     tools: [
       'listDomains',
       'getApiOverview',
@@ -723,26 +783,22 @@ app.get('/health', (_req, res) => {
   res.json({
     status: 'ok',
     service: SERVER_NAME,
-    domains: loadedApis.map(api => api.domain_name),
+    domains: loadedApis.map((api) => api.domain_name),
     api_count: loadedApis.length,
     operations: operations.length,
-    schemas: loadedApis.reduce((total, api) => total + Object.keys(api.schemas ?? {}).length, 0),
+    schemas: loadedApis.reduce(
+      (total, api) => total + Object.keys(api.schemas ?? {}).length,
+      0
+    ),
     version: '2.0.0'
   });
 });
 
-app.get('/health', (_req, res) => {
-  res.json({
-    status: 'ok',
-    service: SERVER_NAME,
-    spec: path.basename(resolvedSpecPath),
-    operations: operations.length,
-    schemas: Object.keys(schemas).length,
-    version: '2.0.0'
+async function handleMcpRequest(req: Request, res: Response) {
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined
   });
-});
-app.post('/mcp', async (req: Request, res: Response) => {
-  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+
   res.on('close', () => transport.close());
 
   try {
@@ -758,6 +814,11 @@ app.post('/mcp', async (req: Request, res: Response) => {
       });
     }
   }
+}
+
+// Claude-compatible endpoint
+app.post('/mcp', async (req: Request, res: Response) => {
+  await handleMcpRequest(req, res);
 });
 
 app.get('/mcp', (_req: Request, res: Response) => {
@@ -768,8 +829,14 @@ app.get('/mcp', (_req: Request, res: Response) => {
   });
 });
 
-app.listen(PORT, () => {
+// OpenAI-facing endpoint
+app.post('/openai-mcp', async (req: Request, res: Response) => {
+  await handleMcpRequest(req, res);
+});
+
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`${SERVER_NAME} listening on port ${PORT}`);
-  console.log(`Health: http://localhost:${PORT}/health`);
-  console.log(`MCP:    http://localhost:${PORT}/mcp`);
+  console.log(`Health:      http://0.0.0.0:${PORT}/health`);
+  console.log(`Claude MCP:  http://0.0.0.0:${PORT}/mcp`);
+  console.log(`OpenAI MCP:  http://0.0.0.0:${PORT}/openai-mcp`);
 });
