@@ -832,14 +832,6 @@ async function handleClaudeMcpRequest(req: Request, res: Response) {
   }
 }
 
-async function handleOpenAiMcpRequest(req: Request, res: Response) {
-  const sessionIdHeader = req.headers['mcp-session-id'];
-  const sessionId =
-    typeof sessionIdHeader === 'string'
-      ? sessionIdHeader
-      : Array.isArray(sessionIdHeader)
-      ? sessionIdHeader[0]
-      : undefined;
 
   let transport: StreamableHTTPServerTransport | undefined;
 
