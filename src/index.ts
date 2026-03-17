@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import crypto from 'node:crypto';
 import express, { type Request, type Response } from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -25,6 +26,20 @@ type LoadedApi = {
   schemas: Record<string, any>;
 };
 
+type Operation = {
+  domain_name: string;
+  path: string;
+  method: string;
+  operationId: string | null;
+  summary: string;
+  description: string;
+  tags: string[];
+  is_write: boolean;
+  parameters: Array<Record<string, unknown>>;
+  requestBody: any;
+  responses: Record<string, unknown>;
+};
+
 const loadedApis: LoadedApi[] = SPEC_FILES.map((filePath) => {
   const resolvedPath = path.resolve(process.cwd(), filePath);
 
@@ -49,20 +64,6 @@ const loadedApis: LoadedApi[] = SPEC_FILES.map((filePath) => {
 });
 
 const HTTP_METHODS = ['get', 'post', 'put', 'patch', 'delete', 'options', 'head'];
-
-type Operation = {
-  domain_name: string;
-  path: string;
-  method: string;
-  operationId: string | null;
-  summary: string;
-  description: string;
-  tags: string[];
-  is_write: boolean;
-  parameters: Array<Record<string, unknown>>;
-  requestBody: any;
-  responses: Record<string, unknown>;
-};
 
 function isWriteMethod(method: string): boolean {
   return ['post', 'put', 'patch', 'delete'].includes(method.toLowerCase());
@@ -158,27 +159,27 @@ function summarizeForBusiness(op: Operation): string {
   } ${hasBody ? 'It also accepts a JSON request body.' : ''}`.trim();
 }
 
-function inferDomainBuckets() {
+function inferAppointmentBuckets() {
   const buckets = [
     {
       name: 'Core Appointment CRUD',
-      match: (op: Operation) => /^\/appointments(\/\{appointment_key\})?$/.test(op.path)
+      match: (op: Operation) => op.domain_name === 'appointment' && /^\/appointments(\/\{appointment_key\})?$/.test(op.path)
     },
     {
       name: 'Capabilities & metadata',
-      match: (op: Operation) => op.path.includes('/capabilities')
+      match: (op: Operation) => op.domain_name === 'appointment' && op.path.includes('/capabilities')
     },
     {
       name: 'Bulk and exports',
-      match: (op: Operation) => op.path.includes('/batch') || op.path.includes('/exports')
+      match: (op: Operation) => op.domain_name === 'appointment' && (op.path.includes('/batch') || op.path.includes('/exports'))
     },
     {
       name: 'Commands / workflows',
-      match: (op: Operation) => op.path.includes('/commands')
+      match: (op: Operation) => op.domain_name === 'appointment' && op.path.includes('/commands')
     },
     {
       name: 'Event messages / audit trail',
-      match: (op: Operation) => op.path.includes('/event-messages')
+      match: (op: Operation) => op.domain_name === 'appointment' && op.path.includes('/event-messages')
     }
   ];
 
@@ -343,6 +344,7 @@ const app = express();
 app.use(express.json({ limit: '1mb' }));
 
 const server = new McpServer({ name: SERVER_NAME, version: '2.0.0' });
+const openAiTransports = new Map<string, StreamableHTTPServerTransport>();
 
 server.tool(
   'getApiOverview',
@@ -374,7 +376,7 @@ server.tool(
           schema_count: Object.keys(apiSchemas).length,
           read_operations: apiOperations.filter((op) => !op.is_write).length,
           write_operations: apiOperations.filter((op) => op.is_write).length,
-          domain_buckets: api.domain_name === 'appointment' ? inferDomainBuckets() : []
+          domain_buckets: api.domain_name === 'appointment' ? inferAppointmentBuckets() : []
         };
       });
 
@@ -403,7 +405,6 @@ server.tool(
   async ({ domain_name, query, include_write = true, include_read = true, group = 'all', limit = 100 }) => {
     try {
       const q = query?.toLowerCase().trim();
-
       const base = group === 'all' ? operations : pickOperationsByGroup(group, domain_name);
 
       const filtered = base.filter((op) => {
@@ -794,7 +795,7 @@ app.get('/health', (_req, res) => {
   });
 });
 
-async function handleMcpRequest(req: Request, res: Response) {
+async function handleClaudeMcpRequest(req: Request, res: Response) {
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined
   });
@@ -805,7 +806,7 @@ async function handleMcpRequest(req: Request, res: Response) {
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
   } catch (error) {
-    console.error('MCP request failure', error);
+    console.error('Claude MCP request failure', error);
     if (!res.headersSent) {
       res.status(500).json({
         jsonrpc: '2.0',
@@ -816,9 +817,44 @@ async function handleMcpRequest(req: Request, res: Response) {
   }
 }
 
+async function handleOpenAiMcpRequest(req: Request, res: Response) {
+  const sessionIdHeader = req.headers['mcp-session-id'];
+  const sessionId =
+    typeof sessionIdHeader === 'string'
+      ? sessionIdHeader
+      : Array.isArray(sessionIdHeader)
+      ? sessionIdHeader[0]
+      : undefined;
+
+  let transport: StreamableHTTPServerTransport | undefined;
+
+  if (sessionId && openAiTransports.has(sessionId)) {
+    transport = openAiTransports.get(sessionId);
+  } else {
+    transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => crypto.randomUUID(),
+      onsessioninitialized: (newSessionId) => {
+        openAiTransports.set(newSessionId, transport!);
+      }
+    });
+
+    transport.onclose = () => {
+      const sid = transport?.sessionId;
+      if (sid) {
+        openAiTransports.delete(sid);
+      }
+    };
+
+    await server.connect(transport);
+  }
+
+  await transport.handleRequest(req, res, req.body);
+}
+
 // Claude-compatible endpoint
 app.post('/mcp', async (req: Request, res: Response) => {
-  await handleMcpRequest(req, res);
+  console.log(`Claude MCP route hit: ${req.method} /mcp`);
+  await handleClaudeMcpRequest(req, res);
 });
 
 app.get('/mcp', (_req: Request, res: Response) => {
@@ -831,7 +867,19 @@ app.get('/mcp', (_req: Request, res: Response) => {
 
 // OpenAI-facing endpoint
 app.all('/openai-mcp', async (req: Request, res: Response) => {
-  await handleMcpRequest(req, res);
+  try {
+    console.log(`OpenAI MCP route hit: ${req.method} /openai-mcp`);
+    await handleOpenAiMcpRequest(req, res);
+  } catch (error) {
+    console.error('OpenAI MCP request failure', error);
+    if (!res.headersSent) {
+      res.status(500).json({
+        jsonrpc: '2.0',
+        error: { code: -32603, message: 'Internal server error' },
+        id: null
+      });
+    }
+  }
 });
 
 app.listen(PORT, '0.0.0.0', () => {
