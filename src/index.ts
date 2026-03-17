@@ -805,9 +805,13 @@ app.get('/mcp', (_req: Request, res: Response) => {
 });
 
 // OpenAI-facing endpoint
+
 app.all('/openai-mcp', async (req: Request, res: Response) => {
   try {
     console.log(`OpenAI MCP route hit: ${req.method} /openai-mcp`);
+    console.log('Headers:', JSON.stringify(req.headers, null, 2));
+    console.log('Body:', JSON.stringify(req.body, null, 2));
+
     await handleOpenAiMcpRequest(req, res);
   } catch (error) {
     console.error('OpenAI MCP request failure', error);
