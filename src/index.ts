@@ -856,7 +856,7 @@ async function handleClaudeMcpRequest(req: Request, res: Response) {
   }
 
   await transport.handleRequest(req, res, req.body);
-}
+
 
 // Claude-compatible endpoint
 app.post('/mcp', async (req: Request, res: Response) => {
