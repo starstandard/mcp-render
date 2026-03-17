@@ -344,8 +344,23 @@ const app = express();
 app.use(express.json({ limit: '1mb' }));
 
 const server = new McpServer({ name: SERVER_NAME, version: '2.0.0' });
-const openAiTransports = new Map<string, StreamableHTTPServerTransport>();
+let openAiTransport: StreamableHTTPServerTransport | null = null;
 
+async function handleOpenAiMcpRequest(req: Request, res: Response) {
+  if (!openAiTransport) {
+    openAiTransport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined
+    });
+
+    openAiTransport.onclose = () => {
+      openAiTransport = null;
+    };
+
+    await server.connect(openAiTransport);
+  }
+
+  await openAiTransport.handleRequest(req, res, req.body);
+}
 server.tool(
   'getApiOverview',
   'Return a high-level summary of one API domain or all loaded API domains.',
